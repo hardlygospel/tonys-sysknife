@@ -21,9 +21,10 @@ fi
 echo "[*] Python: $($PYTHON --version)"
 echo "[*] Installing / upgrading dependencies…"
 
-$PYTHON -m pip install --quiet --upgrade rich prompt_toolkit psutil requests 2>/dev/null \
-    || $PYTHON -m pip install --quiet --upgrade --user rich prompt_toolkit psutil requests 2>/dev/null \
-    || $PYTHON -m pip install --quiet --upgrade --user --break-system-packages rich prompt_toolkit psutil requests
+PIP_FLAGS="--quiet --upgrade --no-warn-script-location"
+$PYTHON -m pip install $PIP_FLAGS rich prompt_toolkit psutil requests 2>/dev/null \
+    || $PYTHON -m pip install $PIP_FLAGS --user rich prompt_toolkit psutil requests 2>/dev/null \
+    || $PYTHON -m pip install $PIP_FLAGS --user --break-system-packages rich prompt_toolkit psutil requests
 
 echo "[*] Launching Tony's Sysadmin Swiss Army Knife…"
 exec "$PYTHON" "$(dirname "$0")/sysknife.py" "$@"
