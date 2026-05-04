@@ -1039,3 +1039,639 @@ def ssh_remove_host(cfg: dict, alias: str) -> dict:
     from sysknife import save_config
     save_config(cfg)
     return cfg
+
+
+# ── Processes ─────────────────────────────────────────────────────────────────
+
+def proc_list(query: str | None = None, sort_by: str = "cpu",
+              limit: int = 50) -> list[dict]:
+    """Return processes optionally filtered by name/cmdline, sorted by CPU or memory."""
+    import psutil
+    # First pass primes psutil's CPU sampler
+    for p in psutil.process_iter():
+        try:
+            p.cpu_percent(None)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    time.sleep(0.4)
+
+    out: list[dict] = []
+    q = (query or "").lower()
+    for p in psutil.process_iter(
+        ["pid", "name", "username", "memory_percent", "status",
+         "cmdline", "create_time"]
+    ):
+        try:
+            i = p.info
+            name = i.get("name") or "?"
+            cmd  = " ".join(i.get("cmdline") or [])
+            if q and q not in name.lower() and q not in cmd.lower():
+                continue
+            cpu = p.cpu_percent(None)
+            out.append({
+                "pid":     i["pid"],
+                "name":    name[:24],
+                "user":    (i.get("username") or "")[:14],
+                "cpu":     float(cpu),
+                "mem":     float(i.get("memory_percent") or 0),
+                "status":  i.get("status", ""),
+                "started": datetime.fromtimestamp(i.get("create_time") or 0)
+                                   .strftime("%H:%M:%S"),
+                "cmd":     cmd[:120],
+            })
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    key = "mem" if sort_by == "mem" else "cpu"
+    out.sort(key=lambda x: x[key], reverse=True)
+    return out[:limit]
+
+
+def proc_tree(root_pid: int | None = None, max_depth: int = 12) -> str:
+    """ASCII process tree. Pass root_pid to limit to a subtree."""
+    import psutil
+    procs: dict[int, "psutil.Process"] = {}
+    for p in psutil.process_iter():
+        try:
+            procs[p.pid] = p
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    children: dict[int, list[int]] = {}
+    for pid, p in procs.items():
+        try:
+            ppid = p.ppid()
+            if ppid != pid:           # skip kernel-style self-parents
+                children.setdefault(ppid, []).append(pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    lines: list[str] = []
+
+    def _walk(pid: int, depth: int) -> None:
+        if depth > max_depth:
+            return
+        p = procs.get(pid)
+        if not p:
+            return
+        try:
+            name = p.name()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return
+        prefix = "  " * depth + ("└─ " if depth else "")
+        lines.append(f"{prefix}{pid:>7}  {name}")
+        for child in sorted(children.get(pid, [])):
+            _walk(child, depth + 1)
+
+    if root_pid:
+        _walk(root_pid, 0)
+    else:
+        roots: list[int] = []
+        for pid, p in procs.items():
+            try:
+                ppid = p.ppid()
+                # A root has either no parent in our dict, OR is its own parent (kernel)
+                if ppid == pid or ppid not in procs:
+                    roots.append(pid)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                roots.append(pid)
+        for r in sorted(roots):
+            _walk(r, 0)
+    return "\n".join(lines) or "(no processes found)"
+
+
+def proc_find_by_port(port: int) -> list[dict]:
+    """Find process(es) listening on a TCP port."""
+    import psutil
+    out: list[dict] = []
+    try:
+        for c in psutil.net_connections(kind="inet"):
+            if c.laddr and c.laddr.port == int(port) and c.status == "LISTEN":
+                if not c.pid:
+                    continue
+                try:
+                    p = psutil.Process(c.pid)
+                    out.append({
+                        "pid":  c.pid,
+                        "name": p.name(),
+                        "user": p.username(),
+                        "addr": f"{c.laddr.ip}:{c.laddr.port}",
+                        "cmd":  " ".join(p.cmdline())[:120],
+                    })
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+    except (psutil.AccessDenied, PermissionError):
+        return [{"error": "Permission denied — try running with sudo / admin"}]
+    except Exception as e:
+        return [{"error": str(e)}]
+    return out
+
+
+def proc_kill(target: str | int, force: bool = False) -> dict:
+    """Kill by PID (int/numeric str) or by exact process name (str)."""
+    import psutil
+    import signal as _sig
+    sig = _sig.SIGKILL if (force and not IS_WINDOWS) else _sig.SIGTERM
+    killed: list[dict] = []
+    errors: list[str] = []
+
+    target_str = str(target)
+    if target_str.isdigit():
+        pid = int(target_str)
+        try:
+            p = psutil.Process(pid)
+            p.send_signal(sig)
+            killed.append({"pid": pid, "name": p.name()})
+        except psutil.NoSuchProcess:
+            errors.append(f"PID {pid} not found")
+        except psutil.AccessDenied:
+            errors.append(f"Access denied for PID {pid} (try sudo / admin)")
+        except Exception as e:
+            errors.append(str(e))
+    else:
+        for p in psutil.process_iter(["pid", "name"]):
+            try:
+                if p.info.get("name", "").lower() == target_str.lower():
+                    p.send_signal(sig)
+                    killed.append({"pid": p.info["pid"], "name": p.info["name"]})
+            except psutil.NoSuchProcess:
+                pass
+            except psutil.AccessDenied:
+                errors.append(f"Access denied for PID {p.info.get('pid')}")
+            except Exception as e:
+                errors.append(str(e))
+        if not killed and not errors:
+            errors.append(f"No processes named '{target_str}'")
+    return {"killed": killed, "errors": errors,
+            "signal": "SIGKILL" if force and not IS_WINDOWS else "SIGTERM"}
+
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+
+def log_recent(unit: str | None = None, level: str | None = None,
+               lines: int = 100, since: str | None = None) -> dict:
+    """Return recent log entries from the system log.
+    unit/level are platform-specific; since is journalctl-style ('1h', '10min')."""
+    try:
+        if IS_LINUX and shutil.which("journalctl"):
+            cmd = ["journalctl", "-n", str(lines), "--no-pager", "-o", "short-iso"]
+            if unit:
+                cmd += ["-u", unit]
+            if level:
+                cmd += ["-p", level]
+            if since:
+                cmd += ["--since", since]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+            return {"lines": [l for l in r.stdout.splitlines() if l.strip()][-lines:]}
+        elif IS_MAC:
+            cmd = ["log", "show", "--last", since or "30m", "--style", "compact"]
+            if unit:
+                cmd += ["--predicate", f"subsystem == '{unit}'"]
+            if level == "err" or level == "error":
+                cmd += ["--predicate", "messageType == error"]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+            output = [l for l in r.stdout.splitlines() if l.strip()]
+            return {"lines": output[-lines:]}
+        elif IS_WINDOWS:
+            log_name = unit or "System"
+            cmd = ["powershell", "-NoProfile", "-Command",
+                   f"Get-EventLog -LogName '{log_name}' -Newest {lines} | "
+                   f"Format-Table TimeGenerated,EntryType,Source,Message "
+                   f"-AutoSize -Wrap | Out-String -Width 200"]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            return {"lines": [l for l in r.stdout.splitlines() if l.strip()][-lines:]}
+        return {"lines": [], "error": "No log source available on this OS"}
+    except Exception as e:
+        return {"lines": [], "error": str(e)}
+
+
+def log_list_units() -> list[str]:
+    """List recently-active systemd units / Windows event logs."""
+    try:
+        if IS_LINUX and shutil.which("systemctl"):
+            r = subprocess.run(
+                ["systemctl", "list-units", "--type=service",
+                 "--no-legend", "--no-pager", "--state=active"],
+                capture_output=True, text=True, timeout=10,
+            )
+            return sorted({l.split()[0] for l in r.stdout.splitlines() if l.strip()})
+        elif IS_WINDOWS:
+            return ["System", "Application", "Security", "Setup"]
+        elif IS_MAC:
+            # Common subsystems users may filter by
+            return ["com.apple.kernel", "com.apple.sharedfilelist",
+                    "com.apple.WindowServer", "com.apple.network",
+                    "com.apple.security"]
+    except Exception:
+        pass
+    return []
+
+
+# ── Network (additional tools) ────────────────────────────────────────────────
+
+def net_whois(domain: str) -> dict:
+    if not shutil.which("whois"):
+        return {"error": "'whois' command not on PATH (apt install whois / brew install whois)"}
+    try:
+        r = subprocess.run(["whois", domain], capture_output=True, text=True, timeout=15)
+        text = r.stdout
+        keys = ("Registrar:", "Creation Date:", "Registry Expiry Date:",
+                "Updated Date:", "Domain Status:", "Name Server:",
+                "Registrant Organization:", "Registrant Country:")
+        fields: dict[str, str] = {}
+        for line in text.splitlines():
+            stripped = line.strip()
+            for key in keys:
+                if stripped.startswith(key):
+                    val = stripped.split(":", 1)[1].strip()
+                    if not val:
+                        continue
+                    label = key.rstrip(":")
+                    fields[label] = (fields[label] + ", " + val) if label in fields else val
+        return {"summary": fields, "raw": text[:6000]}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def net_http_check(url: str, timeout: float = 10.0) -> dict:
+    import requests as req
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    try:
+        t0 = time.time()
+        r = req.get(url, timeout=timeout, allow_redirects=True,
+                    headers={"User-Agent": "sysknife/2.0"})
+        elapsed_ms = (time.time() - t0) * 1000
+        return {
+            "url":          url,
+            "final_url":    r.url,
+            "status":       r.status_code,
+            "reason":       r.reason,
+            "elapsed_ms":   round(elapsed_ms, 1),
+            "redirects":    len(r.history),
+            "size":         _fmt_bytes(len(r.content)),
+            "server":       r.headers.get("Server", "—"),
+            "content_type": r.headers.get("Content-Type", "—"),
+        }
+    except Exception as e:
+        return {"url": url, "error": str(e)}
+
+
+def net_ssl_check(host: str, port: int = 443, timeout: float = 10.0) -> dict:
+    import ssl as _ssl
+    try:
+        ctx = _ssl.create_default_context()
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                cert = ssock.getpeercert()
+                cipher = ssock.cipher()
+                version = ssock.version()
+        not_after = cert.get("notAfter", "")
+        days = None
+        if not_after:
+            try:
+                expiry = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
+                days = (expiry - datetime.utcnow()).days
+            except Exception:
+                pass
+        subject = dict(x[0] for x in cert.get("subject", []))
+        issuer  = dict(x[0] for x in cert.get("issuer", []))
+        sans = [v for k, v in cert.get("subjectAltName", []) if k == "DNS"]
+        return {
+            "Host":            f"{host}:{port}",
+            "TLS Version":     version,
+            "Cipher":          cipher[0] if cipher else "—",
+            "Subject (CN)":    subject.get("commonName", "—"),
+            "Issuer":          issuer.get("organizationName",
+                                          issuer.get("commonName", "—")),
+            "Valid From":      cert.get("notBefore", "—"),
+            "Valid To":        not_after or "—",
+            "Days Remaining":  str(days) if days is not None else "—",
+            "SAN Count":       str(len(sans)),
+            "SANs":            ", ".join(sans[:8]) + (" …" if len(sans) > 8 else ""),
+        }
+    except Exception as e:
+        return {"Host": f"{host}:{port}", "error": str(e)}
+
+
+def net_public_ip() -> dict:
+    """Resolve public IP via several providers (first one to answer wins)."""
+    import requests as req
+    providers = [
+        ("ipify",     "https://api.ipify.org?format=json"),
+        ("ifconfig",  "https://ifconfig.me/ip"),
+        ("icanhazip", "https://icanhazip.com"),
+    ]
+    for name, url in providers:
+        try:
+            r = req.get(url, timeout=5,
+                        headers={"User-Agent": "sysknife/2.0"})
+            if r.status_code != 200:
+                continue
+            ip = (r.json().get("ip") if "json" in r.headers.get("Content-Type", "")
+                  else r.text.strip())
+            if ip:
+                return {"ip": ip, "provider": name}
+        except Exception:
+            continue
+    return {"error": "All public-IP providers unreachable"}
+
+
+def net_my_ips() -> list[dict]:
+    """Local network interfaces with IPv4/IPv6/MAC and link state."""
+    import psutil
+    addrs = psutil.net_if_addrs()
+    stats = psutil.net_if_stats()
+    out: list[dict] = []
+    for name, addr_list in addrs.items():
+        ipv4 = next((a.address for a in addr_list
+                      if a.family.name == "AF_INET"), "")
+        ipv6 = next((a.address for a in addr_list
+                      if a.family.name in ("AF_INET6", "AddressFamily.AF_INET6")), "")
+        mac  = next((a.address for a in addr_list
+                      if a.family.name in ("AF_LINK", "AF_PACKET", "AddressFamily.AF_LINK")), "")
+        st = stats.get(name)
+        out.append({
+            "iface":  name,
+            "ipv4":   ipv4 or "—",
+            "ipv6":   (ipv6.split("%")[0] if ipv6 else "—"),
+            "mac":    mac or "—",
+            "is_up":  "Yes" if st and st.isup else "No",
+            "speed":  f"{st.speed} Mbps" if st and st.speed else "—",
+        })
+    return out
+
+
+def net_port_scan(host: str, ports: list[int], timeout: float = 1.0) -> list[dict]:
+    """Sequential TCP connect-scan. Returns one row per port."""
+    out: list[dict] = []
+    for port in ports:
+        try:
+            with socket.create_connection((host, int(port)), timeout=timeout):
+                out.append({"port": port, "status": "open"})
+        except (socket.timeout, ConnectionRefusedError):
+            out.append({"port": port, "status": "closed"})
+        except Exception as e:
+            out.append({"port": port, "status": f"error ({e.__class__.__name__})"})
+    return out
+
+
+COMMON_PORTS = [21, 22, 23, 25, 53, 80, 110, 143, 443, 445, 465, 587, 631,
+                993, 995, 1433, 1521, 2049, 3306, 3389, 5432, 5900, 5984,
+                6379, 8000, 8080, 8443, 9000, 9090, 9200, 11211, 27017]
+
+
+# ── Cleanup (additional) ──────────────────────────────────────────────────────
+
+def cleanup_apply(items: list[dict]) -> dict:
+    """Actually delete items from a cleanup_* dry-run result."""
+    deleted, freed = 0, 0
+    errors: list[str] = []
+    for it in items:
+        path = it.get("path")
+        if not path:
+            continue
+        try:
+            p = Path(path)
+            if p.is_file():
+                size = p.stat().st_size
+                p.unlink()
+                deleted += 1
+                freed += size
+        except Exception as e:
+            errors.append(f"{path}: {e}")
+    return {"deleted": deleted, "freed": freed,
+            "freed_human": _fmt_bytes(freed),
+            "errors": errors[:10]}
+
+
+def cleanup_big_files(directory: str, top_n: int = 25,
+                      min_size_mb: int = 50) -> list[dict]:
+    """Find largest files under a directory."""
+    p = Path(directory).expanduser()
+    if not p.exists():
+        return [{"error": f"Path not found: {p}"}]
+    min_size = min_size_mb * 1024 * 1024
+    items: list[dict] = []
+    for child in p.rglob("*"):
+        try:
+            if not child.is_file():
+                continue
+            size = child.stat().st_size
+            if size < min_size:
+                continue
+            items.append({
+                "path":  str(child),
+                "size":  size,
+                "size_human": _fmt_bytes(size),
+                "mtime": datetime.fromtimestamp(child.stat().st_mtime)
+                                 .strftime("%Y-%m-%d"),
+            })
+        except (PermissionError, OSError):
+            pass
+    items.sort(key=lambda x: x.get("size", 0), reverse=True)
+    return items[:top_n]
+
+
+def cleanup_old_downloads(days: int = 30) -> CheckResult:
+    items = _scan_dir(str(Path.home() / "Downloads"), older_than_days=days)
+    return _summary_status(items, f"Old Downloads (>{days}d)")
+
+
+# ── Health (additional) ───────────────────────────────────────────────────────
+
+def health_battery() -> dict:
+    import psutil
+    try:
+        b = psutil.sensors_battery()
+    except (AttributeError, NotImplementedError):
+        return {"available": "No"}
+    if b is None:
+        return {"available": "No"}
+    secs = b.secsleft
+    if secs == psutil.POWER_TIME_UNLIMITED:
+        time_left = "Unlimited (plugged in)"
+    elif secs == psutil.POWER_TIME_UNKNOWN:
+        time_left = "Unknown"
+    else:
+        h, m = divmod(secs // 60, 60)
+        time_left = f"{h}h {m}m"
+    return {
+        "available":  "Yes",
+        "Charge":     f"{b.percent:.0f}%",
+        "Plugged In": "Yes" if b.power_plugged else "No",
+        "Time Left":  time_left,
+    }
+
+
+def health_load_avg() -> dict:
+    if not hasattr(os, "getloadavg"):
+        return {"available": "No (Windows — see CPU panel for usage%)"}
+    try:
+        l1, l5, l15 = os.getloadavg()
+        import psutil
+        cores = psutil.cpu_count() or 1
+        def _state(v):
+            return "ok" if v < cores else ("warn" if v < cores * 2 else "fail")
+        return {
+            "1 min":    f"{l1:.2f}",
+            "5 min":    f"{l5:.2f}",
+            "15 min":   f"{l15:.2f}",
+            "Cores":    str(cores),
+            "Status":   _state(l5),
+        }
+    except OSError as e:
+        return {"available": "No", "error": str(e)}
+
+
+def health_temperatures() -> list[dict]:
+    import psutil
+    try:
+        temps = psutil.sensors_temperatures()
+    except (AttributeError, NotImplementedError):
+        return []
+    out: list[dict] = []
+    for sensor, entries in temps.items():
+        for e in entries:
+            out.append({
+                "sensor":  sensor,
+                "label":   e.label or sensor,
+                "current": f"{e.current:.1f}°C",
+                "high":    f"{e.high:.1f}°C" if e.high else "—",
+                "critical": f"{e.critical:.1f}°C" if e.critical else "—",
+            })
+    return out
+
+
+# ── Reports ───────────────────────────────────────────────────────────────────
+
+_HTML_REPORT_CSS = """
+:root { color-scheme: dark; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+       background: #1e1e2e; color: #cdd6f4; margin: 0; padding: 2.5rem; line-height: 1.5; }
+.wrap { max-width: 960px; margin: 0 auto; }
+h1 { color: #cba6f7; font-weight: 500; margin: 0 0 0.4rem; font-size: 28px; letter-spacing: -0.3px; }
+.sub { color: #a6adc8; font-size: 14px; margin-bottom: 2rem; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+.stats { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 2rem; }
+.stat { background: #313244; padding: 0.6rem 1.1rem; border-radius: 8px;
+        font-family: ui-monospace, monospace; font-size: 13px; font-weight: 500; }
+.stat.ok   { color: #a6e3a1; }
+.stat.warn { color: #f9e2af; }
+.stat.fail { color: #f38ba8; }
+.stat.info { color: #89dceb; }
+.stat.skip { color: #6c7086; }
+.card { background: #313244; border-radius: 12px; padding: 1.1rem 1.25rem;
+        margin-bottom: 0.8rem; border-left: 4px solid #6c7086; }
+.card.ok   { border-left-color: #a6e3a1; }
+.card.warn { border-left-color: #f9e2af; }
+.card.fail { border-left-color: #f38ba8; }
+.card.skip { border-left-color: #6c7086; }
+.card.info { border-left-color: #89dceb; }
+.card .name   { font-weight: 600; font-size: 14px; }
+.card .pill   { float: right; font-family: ui-monospace, monospace;
+                padding: 2px 10px; border-radius: 99px; font-size: 11px; font-weight: 600; }
+.pill.ok   { background: #a6e3a1; color: #1e1e2e; }
+.pill.warn { background: #f9e2af; color: #1e1e2e; }
+.pill.fail { background: #f38ba8; color: #1e1e2e; }
+.pill.skip { background: #6c7086; color: #1e1e2e; }
+.pill.info { background: #89dceb; color: #1e1e2e; }
+.card .detail { color: #bac2de; font-family: ui-monospace, monospace;
+                font-size: 13px; margin-top: 6px; }
+.card ul { margin: 6px 0 0 18px; color: #a6adc8; font-family: ui-monospace, monospace;
+           font-size: 12px; }
+footer { color: #6c7086; font-size: 12px; margin-top: 3rem;
+         padding-top: 1rem; border-top: 1px solid #45475a; }
+footer a { color: #89b4fa; text-decoration: none; }
+"""
+
+
+def report_morning_html(cfg: dict, results: list[CheckResult]) -> str:
+    from html import escape as _esc
+    import socket as _s
+    counts = {"ok": 0, "warn": 0, "fail": 0, "skip": 0, "info": 0}
+    for r in results:
+        counts[r.status] = counts.get(r.status, 0) + 1
+    cards = []
+    for r in results:
+        items_html = ""
+        if r.items:
+            items_html = "<ul>" + "".join(
+                f"<li>{_esc(str(i))}</li>" for i in r.items[:10]
+            ) + "</ul>"
+        cards.append(
+            f'<div class="card {r.status}">'
+            f'<span class="pill {r.status}">{r.status.upper()}</span>'
+            f'<span class="name">{_esc(r.name)}</span>'
+            f'<div class="detail">{_esc(r.detail)}{items_html}</div>'
+            f'</div>'
+        )
+    stats_html = "".join(
+        f'<div class="stat {k}">{v} {k}</div>'
+        for k, v in counts.items() if v > 0
+    )
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    hostname = _s.gethostname()
+    return (
+        f"<!doctype html><html><head><meta charset='utf-8'>"
+        f"<title>Sysknife Report — {_esc(hostname)} — {now}</title>"
+        f"<style>{_HTML_REPORT_CSS}</style></head>"
+        f"<body><div class='wrap'>"
+        f"<h1>⚔ Sysknife Morning Report</h1>"
+        f"<p class='sub'>{_esc(hostname)} · {now} · {_esc(sys.platform)}</p>"
+        f"<div class='stats'>{stats_html}</div>"
+        f"{''.join(cards)}"
+        f"<footer>Generated by Tony's Sysadmin Swiss Army Knife · "
+        f"<a href='https://github.com/hardlygospel/tonys-sysknife'>"
+        f"github.com/hardlygospel/tonys-sysknife</a></footer>"
+        f"</div></body></html>"
+    )
+
+
+def report_morning_text(cfg: dict, results: list[CheckResult]) -> str:
+    import socket as _s
+    icons = {"ok": "[ OK ]", "warn": "[WARN]", "fail": "[FAIL]",
+             "skip": "[SKIP]", "info": "[INFO]"}
+    lines = [
+        "Sysknife Morning Report",
+        "=" * 60,
+        f"Host:      {_s.gethostname()}",
+        f"Platform:  {sys.platform}",
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+    ]
+    for r in results:
+        lines.append(f"{icons.get(r.status, '[? ]')} {r.name:<26}  {r.detail}")
+    lines.append("")
+    lines.append("-" * 60)
+    counts: dict[str, int] = {}
+    for r in results:
+        counts[r.status] = counts.get(r.status, 0) + 1
+    summary = "  ".join(f"{v} {k}" for k, v in counts.items() if v)
+    lines.append(f"Summary: {summary}")
+    return "\n".join(lines)
+
+
+def report_morning_json(cfg: dict, results: list[CheckResult]) -> str:
+    import json as _json
+    import socket as _s
+    return _json.dumps({
+        "host":      _s.gethostname(),
+        "platform":  sys.platform,
+        "generated": datetime.now().isoformat(timespec="seconds"),
+        "results": [
+            {"name": r.name, "status": r.status, "detail": r.detail,
+             "value": r.value, "items": r.items}
+            for r in results
+        ],
+    }, indent=2, default=str)
+
+
+def save_report(content: str, fmt: str = "html",
+                path: str | Path | None = None) -> str:
+    """Write a report to disk and return the resolved path."""
+    if path is None:
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = Path.home() / f"sysknife-report-{ts}.{fmt}"
+    p = Path(path).expanduser()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8")
+    return str(p)

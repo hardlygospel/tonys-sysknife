@@ -17,7 +17,7 @@ from pathlib import Path
 # ── constants ─────────────────────────────────────────────────────────────────
 APP_NAME    = "Tony's Sysadmin Swiss Army Knife"
 APP_SLUG    = "sysknife"
-APP_VERSION = "1.0.0"
+APP_VERSION = "2.0.0"
 CONFIG_DIR  = Path.home() / ".sysknife"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
@@ -147,9 +147,15 @@ def parse_args() -> argparse.Namespace:
         description=f"{APP_NAME} v{APP_VERSION}",
     )
     p.add_argument("--tui",     action="store_true", help="Force TUI even on Windows")
-    p.add_argument("--module",  metavar="NAME",      help="Open module directly (morning/ad/azure/health/network/cleanup/ssh/settings)")
-    p.add_argument("--check",   action="store_true", help="Run morning checklist non-interactively, exit 0=all-ok 1=issues")
-    p.add_argument("--version", action="version",    version=f"{APP_NAME} v{APP_VERSION}")
+    p.add_argument("--module",  metavar="NAME",
+                   help="Open module directly (morning/ad/azure/health/network/cleanup/ssh/procs/logs/settings)")
+    p.add_argument("--check",   action="store_true",
+                   help="Run morning checklist non-interactively (exit 0=ok, 1=issues)")
+    p.add_argument("--report",  metavar="PATH", nargs="?", const="auto",
+                   help="With --check: save HTML report (or .json by extension). Use 'auto' to pick a path automatically.")
+    p.add_argument("--watch",   action="store_true",
+                   help="With --module health: open the live auto-refreshing dashboard")
+    p.add_argument("--version", action="version", version=f"{APP_NAME} v{APP_VERSION}")
     return p.parse_args()
 
 

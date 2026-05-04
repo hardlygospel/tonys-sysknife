@@ -159,8 +159,31 @@ class MorningPanel(BasePanel):
         self._section("Morning Checklist")
         btn_row = tk.Frame(self, bg=BG)
         btn_row.pack(fill="x", padx=16, pady=(0, 8))
-        self._btn(btn_row, "Run All Checks", self._run, CYAN)
+        self._btn(btn_row, "Run All Checks",   self._run,    CYAN)
+        self._btn(btn_row, "HTML Report",       self._report, MAUVE)
+        self._btn(btn_row, "JSON Report",       self._json,   GREEN)
+        self.last_results: list = []
         self.out = self._output(22)
+
+    def _report(self) -> None:
+        from modules import (run_morning_checks, report_morning_html, save_report)
+        if not self.last_results:
+            self.last_results = run_morning_checks(self.cfg)
+        path = save_report(report_morning_html(self.cfg, self.last_results), "html")
+        self._write(self.out, f"✓  HTML report saved to:\n  {path}\n", GREEN)
+        try:
+            import webbrowser
+            webbrowser.open(f"file://{path}")
+            self._append(self.out, "  Opened in your default browser.\n", SUBTEXT)
+        except Exception:
+            pass
+
+    def _json(self) -> None:
+        from modules import (run_morning_checks, report_morning_json, save_report)
+        if not self.last_results:
+            self.last_results = run_morning_checks(self.cfg)
+        path = save_report(report_morning_json(self.cfg, self.last_results), "json")
+        self._write(self.out, f"✓  JSON report saved to:\n  {path}\n", GREEN)
 
     def _run(self) -> None:
         self._write(self.out, "Running checks…\n", CYAN, clear=True)
@@ -171,6 +194,7 @@ class MorningPanel(BasePanel):
             return run_morning_checks(self.cfg)
 
         def _done(results):
+            self.last_results = results
             self.out.config(state="normal")
             self.out.delete("1.0", "end")
             icons = {"ok": "✓", "warn": "⚠", "fail": "✗", "skip": "·", "info": "●"}
@@ -457,8 +481,78 @@ class HealthPanel(BasePanel):
         self._btn(ab, "Procs",    self._procs,    YELLOW)
         self._btn(ab, "Net I/O",  self._netio,    MAUVE)
         self._btn(ab, "Services", self._services, TEAL)
-        self._btn(ab, "All",      self._all,      ORANGE)
+        self._btn(ab, "Battery",  self._battery,  ORANGE)
+        self._btn(ab, "Temps",    self._temps,    PINK)
+        self._btn(ab, "Load",     self._load,     CYAN)
+
+        wb = tk.Frame(self, bg=BG)
+        wb.pack(fill="x", padx=16, pady=(0, 8))
+        self._watch_var = tk.BooleanVar(value=False)
+        self._watch_btn = tk.Checkbutton(
+            wb, text="  Auto-refresh (2s)  ", variable=self._watch_var,
+            command=self._toggle_watch,
+            bg=BG, fg=GREEN, activebackground=BG, activeforeground=GREEN,
+            selectcolor=SURFACE, font=("Segoe UI", 9, "bold"),
+            relief="flat", cursor="hand2",
+        )
+        self._watch_btn.pack(side="left")
+        self._btn(wb, "Run All",  self._all, ORANGE)
         self.out = self._output(20)
+
+    def _toggle_watch(self) -> None:
+        if self._watch_var.get():
+            self._watch_tick()
+
+    def _watch_tick(self) -> None:
+        if not self._watch_var.get():
+            return
+        from modules import health_cpu, health_memory, health_top_processes
+        cpu = health_cpu()
+        mem = health_memory()
+        procs = health_top_processes(10)
+        self.out.config(state="normal")
+        self.out.delete("1.0", "end")
+        self._append(self.out, "── Live Watch ──\n", MAUVE)
+        for k, v in cpu.items():
+            self._append(self.out, f"  {k:<22} {v}\n", TEXT)
+        self._append(self.out, "\n", TEXT)
+        for k, v in mem.items():
+            self._append(self.out, f"  {k:<22} {v}\n", TEXT)
+        self._append(self.out, "\n  Top processes:\n", MAUVE)
+        for p in procs:
+            cpu_pct = float(p.get("cpu", 0))
+            color = GREEN if cpu_pct < 30 else YELLOW if cpu_pct < 70 else RED
+            self._append(self.out,
+                f"  {str(p['pid']):<7} {p['name']:<24} "
+                f"CPU {p['cpu']:>5}%  MEM {p['mem']:>4}%\n", color)
+        self.out.config(state="disabled")
+        self.after(2000, self._watch_tick)
+
+    def _battery(self) -> None:
+        from modules import health_battery
+        def _go(): return health_battery()
+        def _done(r): self.after(0, self._show_dict, "Battery", r)
+        _run_bg(_go, on_done=_done)
+
+    def _temps(self) -> None:
+        from modules import health_temperatures
+        self._write(self.out, "── Temperatures ──\n", MAUVE, clear=True)
+        def _go(): return health_temperatures()
+        def _done(rows):
+            if not rows:
+                self._append(self.out, "  Sensors not available on this system.\n", YELLOW)
+                return
+            for row in rows:
+                self._append(self.out,
+                    f"  {row.get('label',''):<24} {row.get('current','')}  "
+                    f"(high {row.get('high','—')}, crit {row.get('critical','—')})\n", TEXT)
+        _run_bg(_go, on_done=lambda r: self.after(0, _done, r))
+
+    def _load(self) -> None:
+        from modules import health_load_avg
+        def _go(): return health_load_avg()
+        def _done(r): self.after(0, self._show_dict, "Load Average", r)
+        _run_bg(_go, on_done=_done)
 
     def _show_dict(self, title: str, d: dict) -> None:
         self._write(self.out, f"── {title} ──\n", MAUVE, clear=True)
@@ -542,14 +636,25 @@ class NetworkPanel(BasePanel):
         self._section("Network")
         form = tk.Frame(self, bg=BG)
         form.pack(fill="x", padx=16, pady=(0, 8))
-        _, self.host_ent = self._labeled_entry(form, "Host / IP:")
-        btn_row = tk.Frame(self, bg=BG)
-        btn_row.pack(fill="x", padx=16, pady=(0, 8))
-        self._btn(btn_row, "Ping",        self._ping,  YELLOW)
-        self._btn(btn_row, "Ping All",    self._ping_all, ORANGE)
-        self._btn(btn_row, "Port Check",  self._port,  CYAN)
-        self._btn(btn_row, "DNS Lookup",  self._dns,   BLUE)
-        self._btn(btn_row, "Traceroute",  self._trace, MAUVE)
+        _, self.host_ent = self._labeled_entry(form, "Host / URL / Domain:")
+
+        row1 = tk.Frame(self, bg=BG)
+        row1.pack(fill="x", padx=16, pady=(0, 6))
+        self._btn(row1, "Ping",        self._ping,     YELLOW)
+        self._btn(row1, "Ping All",    self._ping_all, ORANGE)
+        self._btn(row1, "Port Check",  self._port,     CYAN)
+        self._btn(row1, "DNS Lookup",  self._dns,      BLUE)
+        self._btn(row1, "Traceroute",  self._trace,    MAUVE)
+
+        row2 = tk.Frame(self, bg=BG)
+        row2.pack(fill="x", padx=16, pady=(0, 8))
+        self._btn(row2, "HTTP Check",  self._http,   GREEN)
+        self._btn(row2, "SSL Check",   self._ssl,    PINK)
+        self._btn(row2, "WHOIS",       self._whois,  TEAL)
+        self._btn(row2, "Public IP",   self._pubip,  MAUVE)
+        self._btn(row2, "My IPs",      self._myips,  CYAN)
+        self._btn(row2, "Port Scan",   self._scan,   ORANGE)
+
         self.out = self._output(18)
 
     def _host(self) -> str:
@@ -632,6 +737,116 @@ class NetworkPanel(BasePanel):
                 self._append(self.out, f"✗  {res['error']}\n", RED)
             else:
                 self._write(self.out, res.get("output", ""), TEXT, clear=True)
+        _run_bg(_go, on_done=lambda r: self.after(0, _done, r))
+
+    def _http(self) -> None:
+        url = self._host()
+        if not url:
+            messagebox.showwarning("No URL", "Enter a URL first.")
+            return
+        from modules import net_http_check
+        self._write(self.out, f"HTTP {url}…\n", CYAN, clear=True)
+        def _go(): return net_http_check(url)
+        def _done(res):
+            self.out.config(state="normal"); self.out.delete("1.0", "end")
+            if res.get("error"):
+                self._append(self.out, f"✗  {res['error']}\n", RED)
+            else:
+                color = GREEN if 200 <= res.get("status", 0) < 400 else YELLOW
+                for k, v in res.items():
+                    self._append(self.out, f"  {k:<16} {v}\n",
+                                 color if k == "status" else TEXT)
+            self.out.config(state="disabled")
+        _run_bg(_go, on_done=lambda r: self.after(0, _done, r))
+
+    def _ssl(self) -> None:
+        host = self._host()
+        if not host:
+            messagebox.showwarning("No host", "Enter a host first.")
+            return
+        from modules import net_ssl_check
+        self._write(self.out, f"Inspecting SSL on {host}:443…\n", CYAN, clear=True)
+        def _go(): return net_ssl_check(host, 443)
+        def _done(res):
+            self.out.config(state="normal"); self.out.delete("1.0", "end")
+            if res.get("error"):
+                self._append(self.out, f"✗  {res['error']}\n", RED)
+            else:
+                for k, v in res.items():
+                    days = res.get("Days Remaining")
+                    color = TEXT
+                    if k == "Days Remaining" and str(days).isdigit():
+                        d = int(days)
+                        color = GREEN if d > 30 else YELLOW if d > 7 else RED
+                    self._append(self.out, f"  {k:<18} {v}\n", color)
+            self.out.config(state="disabled")
+        _run_bg(_go, on_done=lambda r: self.after(0, _done, r))
+
+    def _whois(self) -> None:
+        domain = self._host()
+        if not domain:
+            messagebox.showwarning("No domain", "Enter a domain first.")
+            return
+        from modules import net_whois
+        self._write(self.out, f"WHOIS {domain}…\n", CYAN, clear=True)
+        def _go(): return net_whois(domain)
+        def _done(res):
+            self.out.config(state="normal"); self.out.delete("1.0", "end")
+            if res.get("error"):
+                self._append(self.out, f"✗  {res['error']}\n", RED)
+            else:
+                for k, v in res.get("summary", {}).items():
+                    self._append(self.out, f"  {k:<28} {v}\n", TEXT)
+            self.out.config(state="disabled")
+        _run_bg(_go, on_done=lambda r: self.after(0, _done, r))
+
+    def _pubip(self) -> None:
+        from modules import net_public_ip
+        self._write(self.out, "Looking up public IP…\n", CYAN, clear=True)
+        def _go(): return net_public_ip()
+        def _done(res):
+            if res.get("error"):
+                self._append(self.out, f"✗  {res['error']}\n", RED)
+            else:
+                self._write(self.out,
+                    f"  Public IP: {res['ip']}  (via {res['provider']})\n",
+                    GREEN, clear=True)
+        _run_bg(_go, on_done=lambda r: self.after(0, _done, r))
+
+    def _myips(self) -> None:
+        from modules import net_my_ips
+        self._write(self.out, "Local interfaces…\n", CYAN, clear=True)
+        def _go(): return net_my_ips()
+        def _done(rows):
+            self.out.config(state="normal"); self.out.delete("1.0", "end")
+            self._append(self.out,
+                f"  {'IFACE':<14}{'IPv4':<18}{'IPv6':<24}{'MAC':<20}{'UP':<5}{'SPEED'}\n",
+                SUBTEXT)
+            for r in rows:
+                self._append(self.out,
+                    f"  {r['iface']:<14}{r['ipv4']:<18}{r['ipv6']:<24}"
+                    f"{r['mac']:<20}{r['is_up']:<5}{r['speed']}\n", TEXT)
+            self.out.config(state="disabled")
+        _run_bg(_go, on_done=lambda r: self.after(0, _done, r))
+
+    def _scan(self) -> None:
+        host = self._host()
+        if not host:
+            messagebox.showwarning("No host", "Enter a host first.")
+            return
+        from modules import net_port_scan, COMMON_PORTS
+        self._write(self.out, f"Scanning {len(COMMON_PORTS)} common ports on {host}…\n",
+                    CYAN, clear=True)
+        def _go(): return net_port_scan(host, COMMON_PORTS)
+        def _done(rows):
+            self.out.config(state="normal"); self.out.delete("1.0", "end")
+            opens = [r for r in rows if r["status"] == "open"]
+            self._append(self.out,
+                f"  {len(opens)} open / {len(rows) - len(opens)} closed\n\n", MAUVE)
+            for r in rows:
+                color = GREEN if r["status"] == "open" else SUBTEXT
+                self._append(self.out, f"  {r['port']:>6}  {r['status']}\n", color)
+            self.out.config(state="disabled")
         _run_bg(_go, on_done=lambda r: self.after(0, _done, r))
 
 
@@ -800,6 +1015,235 @@ class SSHPanel(BasePanel):
 
 # ── Settings ──────────────────────────────────────────────────────────────────
 
+# ── Processes ─────────────────────────────────────────────────────────────────
+
+class ProcessesPanel(BasePanel):
+    def _build(self) -> None:
+        self._section("Processes")
+        sf = tk.Frame(self, bg=BG)
+        sf.pack(fill="x", padx=16, pady=(0, 8))
+        tk.Label(sf, text="Filter:", bg=BG, fg=SUBTEXT,
+                 font=("Segoe UI", 9)).pack(side="left")
+        self.q = tk.StringVar()
+        tk.Entry(sf, textvariable=self.q, bg=SURFACE, fg=TEXT,
+                 insertbackground=TEXT, relief="flat",
+                 font=("Segoe UI", 10), width=24).pack(side="left", padx=(6, 0))
+        self._btn(sf, "List CPU", self._cpu_list, ORANGE)
+        self._btn(sf, "List Mem", self._mem_list, YELLOW)
+        self._btn(sf, "Tree",     self._tree,     CYAN)
+
+        kb = tk.Frame(self, bg=BG)
+        kb.pack(fill="x", padx=16, pady=(0, 8))
+        tk.Label(kb, text="Port:", bg=BG, fg=SUBTEXT,
+                 font=("Segoe UI", 9)).pack(side="left")
+        self.port = tk.StringVar()
+        tk.Entry(kb, textvariable=self.port, bg=SURFACE, fg=TEXT,
+                 insertbackground=TEXT, relief="flat",
+                 font=("Segoe UI", 10), width=8).pack(side="left", padx=(6, 0))
+        self._btn(kb, "Find by Port", self._port_find, MAUVE)
+
+        tk.Label(kb, text="     PID/Name:", bg=BG, fg=SUBTEXT,
+                 font=("Segoe UI", 9)).pack(side="left")
+        self.target = tk.StringVar()
+        tk.Entry(kb, textvariable=self.target, bg=SURFACE, fg=TEXT,
+                 insertbackground=TEXT, relief="flat",
+                 font=("Segoe UI", 10), width=14).pack(side="left", padx=(6, 0))
+        self._btn(kb, "Kill (TERM)", lambda: self._kill(False), RED)
+        self._btn(kb, "Kill (-9)",   lambda: self._kill(True),  RED)
+
+        self.out = self._output(20)
+
+    def _cpu_list(self) -> None:
+        from modules import proc_list
+        self._write(self.out, "Loading processes…\n", CYAN, clear=True)
+        q = self.q.get().strip() or None
+        def _go(): return proc_list(query=q, sort_by="cpu", limit=40)
+        def _done(rows):
+            self.out.config(state="normal"); self.out.delete("1.0", "end")
+            self._append(self.out,
+                f"  {'PID':<8}{'NAME':<24}{'USER':<14}{'CPU%':<8}{'MEM%':<8}{'STARTED'}\n", SUBTEXT)
+            for r in rows:
+                color = (GREEN if r["cpu"] < 30
+                         else YELLOW if r["cpu"] < 70 else RED)
+                self._append(self.out,
+                    f"  {r['pid']:<8}{r['name']:<24}{r['user']:<14}"
+                    f"{r['cpu']:<8.1f}{r['mem']:<8.1f}{r['started']}\n", color)
+            self.out.config(state="disabled")
+        _run_bg(_go, on_done=lambda r: self.after(0, _done, r))
+
+    def _mem_list(self) -> None:
+        from modules import proc_list
+        self._write(self.out, "Loading by memory…\n", CYAN, clear=True)
+        q = self.q.get().strip() or None
+        def _go(): return proc_list(query=q, sort_by="mem", limit=40)
+        def _done(rows):
+            self.out.config(state="normal"); self.out.delete("1.0", "end")
+            self._append(self.out,
+                f"  {'PID':<8}{'NAME':<24}{'USER':<14}{'MEM%':<8}{'CPU%':<8}\n", SUBTEXT)
+            for r in rows:
+                self._append(self.out,
+                    f"  {r['pid']:<8}{r['name']:<24}{r['user']:<14}"
+                    f"{r['mem']:<8.1f}{r['cpu']:<8.1f}\n", TEXT)
+            self.out.config(state="disabled")
+        _run_bg(_go, on_done=lambda r: self.after(0, _done, r))
+
+    def _tree(self) -> None:
+        from modules import proc_tree
+        self._write(self.out, "Building process tree…\n", CYAN, clear=True)
+        def _go(): return proc_tree()
+        def _done(text): self._write(self.out, text, TEXT, clear=True)
+        _run_bg(_go, on_done=lambda r: self.after(0, _done, r))
+
+    def _port_find(self) -> None:
+        port_s = self.port.get().strip()
+        if not port_s.isdigit():
+            messagebox.showwarning("Bad port", "Port must be numeric.")
+            return
+        from modules import proc_find_by_port
+        self._write(self.out, f"Finding listeners on :{port_s}…\n", CYAN, clear=True)
+        def _go(): return proc_find_by_port(int(port_s))
+        def _done(rows):
+            if not rows:
+                self._append(self.out, "Nothing listening.\n", YELLOW)
+                return
+            if "error" in rows[0]:
+                self._append(self.out, f"✗  {rows[0]['error']}\n", RED)
+                return
+            for r in rows:
+                self._append(self.out,
+                    f"  PID {r['pid']:<7} {r['name']:<22} "
+                    f"{r['user']:<12} {r['addr']}\n", TEXT)
+                self._append(self.out, f"    cmd: {r['cmd']}\n", SUBTEXT)
+        _run_bg(_go, on_done=lambda r: self.after(0, _done, r))
+
+    def _kill(self, force: bool) -> None:
+        target = self.target.get().strip()
+        if not target:
+            messagebox.showwarning("Empty", "Enter PID or name first.")
+            return
+        sig = "SIGKILL" if force else "SIGTERM"
+        if not messagebox.askyesno("Confirm",
+                                   f"Send {sig} to '{target}'?"):
+            return
+        from modules import proc_kill
+        def _go(): return proc_kill(target, force=force)
+        def _done(res):
+            for k in res["killed"]:
+                self._append(self.out,
+                    f"✓  Killed PID {k['pid']} ({k['name']})\n", GREEN)
+            for e in res["errors"]:
+                self._append(self.out, f"✗  {e}\n", RED)
+        _run_bg(_go, on_done=lambda r: self.after(0, _done, r))
+
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+
+class LogsPanel(BasePanel):
+    def _build(self) -> None:
+        self._section("Logs")
+        sf = tk.Frame(self, bg=BG)
+        sf.pack(fill="x", padx=16, pady=(0, 8))
+        tk.Label(sf, text="Unit / Source:", bg=BG, fg=SUBTEXT,
+                 font=("Segoe UI", 9)).pack(side="left")
+        self.unit = tk.StringVar()
+        tk.Entry(sf, textvariable=self.unit, bg=SURFACE, fg=TEXT,
+                 insertbackground=TEXT, relief="flat",
+                 font=("Segoe UI", 10), width=22).pack(side="left", padx=(6, 0))
+        tk.Label(sf, text="Lines:", bg=BG, fg=SUBTEXT,
+                 font=("Segoe UI", 9)).pack(side="left", padx=(10, 0))
+        self.lines = tk.StringVar(value="100")
+        tk.Entry(sf, textvariable=self.lines, bg=SURFACE, fg=TEXT,
+                 insertbackground=TEXT, relief="flat",
+                 font=("Segoe UI", 10), width=6).pack(side="left", padx=(6, 0))
+
+        bb = tk.Frame(self, bg=BG)
+        bb.pack(fill="x", padx=16, pady=(0, 8))
+        self._btn(bb, "Recent",   self._recent, MAUVE)
+        self._btn(bb, "Errors",   self._errors, RED)
+        self._btn(bb, "By Unit",  self._unit,   BLUE)
+        self._btn(bb, "List Units", self._list, CYAN)
+        self.out = self._output(22)
+
+    def _show(self, lines: list[str]) -> None:
+        self.out.config(state="normal"); self.out.delete("1.0", "end")
+        if not lines:
+            self._append(self.out, "(no log lines returned)\n", YELLOW)
+            return
+        for line in lines:
+            ll = line.lower()
+            if any(w in ll for w in (" error", " err ", "fatal", "critical")):
+                color = RED
+            elif any(w in ll for w in (" warn", " warning", " notice")):
+                color = YELLOW
+            else:
+                color = TEXT
+            self._append(self.out, line + "\n", color)
+        self.out.config(state="disabled")
+
+    def _n(self) -> int:
+        try:
+            return max(1, min(int(self.lines.get()), 5000))
+        except ValueError:
+            return 100
+
+    def _recent(self) -> None:
+        from modules import log_recent
+        self._write(self.out, "Loading recent log lines…\n", CYAN, clear=True)
+        n = self._n()
+        def _go(): return log_recent(lines=n)
+        def _done(res):
+            if res.get("error"):
+                self._write(self.out, f"✗  {res['error']}\n", RED, clear=True)
+            else:
+                self._show(res.get("lines", []))
+        _run_bg(_go, on_done=lambda r: self.after(0, _done, r))
+
+    def _errors(self) -> None:
+        from modules import log_recent
+        level = "err" if sys.platform.startswith("linux") else "error"
+        self._write(self.out, "Loading error logs…\n", CYAN, clear=True)
+        n = self._n()
+        def _go(): return log_recent(level=level, lines=n)
+        def _done(res):
+            if res.get("error"):
+                self._write(self.out, f"✗  {res['error']}\n", RED, clear=True)
+            else:
+                self._show(res.get("lines", []))
+        _run_bg(_go, on_done=lambda r: self.after(0, _done, r))
+
+    def _unit(self) -> None:
+        u = self.unit.get().strip()
+        if not u:
+            messagebox.showwarning("Empty", "Enter a unit / source name.")
+            return
+        from modules import log_recent
+        self._write(self.out, f"Loading logs for {u}…\n", CYAN, clear=True)
+        n = self._n()
+        def _go(): return log_recent(unit=u, lines=n)
+        def _done(res):
+            if res.get("error"):
+                self._write(self.out, f"✗  {res['error']}\n", RED, clear=True)
+            else:
+                self._show(res.get("lines", []))
+        _run_bg(_go, on_done=lambda r: self.after(0, _done, r))
+
+    def _list(self) -> None:
+        from modules import log_list_units
+        self._write(self.out, "Listing log sources…\n", CYAN, clear=True)
+        def _go(): return log_list_units()
+        def _done(units):
+            self.out.config(state="normal"); self.out.delete("1.0", "end")
+            if not units:
+                self._append(self.out, "No sources detected.\n", YELLOW)
+            else:
+                for u in units:
+                    self._append(self.out, f"  {u}\n", TEXT)
+            self.out.config(state="disabled")
+        _run_bg(_go, on_done=lambda r: self.after(0, _done, r))
+
+
+# ── Settings ──────────────────────────────────────────────────────────────────
+
 class SettingsPanel(BasePanel):
     def _build(self) -> None:
         canvas = tk.Canvas(self, bg=BG, highlightthickness=0)
@@ -919,15 +1363,21 @@ class SettingsPanel(BasePanel):
 # ── Main Application ──────────────────────────────────────────────────────────
 
 PANELS = [
-    ("Morning",   MorningPanel,  "☀"),
-    ("AD",        ADPanel,       "🏢"),
-    ("Azure",     AzurePanel,    "☁"),
-    ("Health",    HealthPanel,   "💚"),
-    ("Network",   NetworkPanel,  "🌐"),
-    ("Cleanup",   CleanupPanel,  "🧹"),
-    ("SSH",       SSHPanel,      "🔐"),
-    ("Settings",  SettingsPanel, "⚙"),
+    ("Morning",   MorningPanel,    "☀"),
+    ("AD",        ADPanel,         "🏢"),
+    ("Azure",     AzurePanel,      "☁"),
+    ("Health",    HealthPanel,     "💚"),
+    ("Network",   NetworkPanel,    "🌐"),
+    ("Cleanup",   CleanupPanel,    "🧹"),
+    ("SSH",       SSHPanel,        "🔐"),
+    ("Processes", ProcessesPanel,  "⚙"),
+    ("Logs",      LogsPanel,       "📜"),
+    ("Settings",  SettingsPanel,   "🔧"),
 ]
+
+
+MODULE_COLORS["Processes"] = ORANGE
+MODULE_COLORS["Logs"]      = MAUVE
 
 
 class SysknifeApp(tk.Tk):
@@ -965,9 +1415,9 @@ class SysknifeApp(tk.Tk):
 
         title_f = tk.Frame(hdr, bg=BG2)
         title_f.pack(side="left", padx=20, pady=12)
-        tk.Label(title_f, text="Tony's Sysadmin Swiss Army Knife",
+        tk.Label(title_f, text="⚔  Tony's Sysadmin Swiss Army Knife",
                  bg=BG2, fg=CYAN, font=("Segoe UI", 14, "bold")).pack(anchor="w")
-        tk.Label(title_f, text="v1.0.0  ·  Morning Checklist · AD · Azure · Health · Network · Cleanup · SSH",
+        tk.Label(title_f, text="v2.0.0  ·  Morning · AD · Azure · Health · Network · Cleanup · SSH · Processes · Logs",
                  bg=BG2, fg=SUBTEXT, font=("Segoe UI", 9)).pack(anchor="w")
 
         self.status_var = tk.StringVar(value="Ready")
